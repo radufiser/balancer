@@ -2,6 +2,8 @@ package balancer
 
 import (
 	"context"
+	"log"
+	"sync"
 
 	"gitlab.com/kiwicom/search-team/balancer/work"
 )
@@ -44,7 +46,14 @@ type Server interface {
 // At that point, the server's capacity should be divided between the two remaining clients, allowing them to
 // send 50 parallel requests each.
 type Balancer struct {
-	// implement me
+	maxParallelRequests int32
+	server              Server
+	weightedSlice       *WeightedSlice[Client]
+	workQueue           chan *work.Request
+	clientsChan         map[Client]chan *work.Request
+	mu                  sync.Mutex
+	wg                  sync.WaitGroup
+	cancel              context.CancelFunc
 }
 
 // New creates a new Balancer instance.
@@ -53,11 +62,104 @@ type Balancer struct {
 // to the server.
 // THIS IS A HARD REQUIREMENT - THE SERVICE CANNOT PROCESS MORE THAN maxParallelRequests IN PARALLEL.
 func New(server Server, maxParallelRequests int32) *Balancer {
-	panic("implement me")
+	ctx, cancel := context.WithCancel(context.Background())
+	b := Balancer{
+		server:              server,
+		maxParallelRequests: maxParallelRequests,
+		weightedSlice:       NewWeightedSlice[Client](),
+		workQueue:           make(chan *work.Request, maxParallelRequests),
+		clientsChan:         make(map[Client]chan *work.Request),
+		cancel:              cancel,
+	}
+
+	b.workerPool(int(maxParallelRequests), ctx)
+	go b.start(ctx)
+	return &b
 }
 
 // Register a client to the balancer and start dispatching its requests to the server.
 // Assume that one client can register itself multiple times.
 func (b *Balancer) Register(ctx context.Context, client Client) {
-	panic("implement me")
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	log.Printf("Registering client %+v\n", client)
+	b.weightedSlice.AddItem(WeightedItem[Client]{Value: client, Weight: client.Weight()})
+	reqChan := client.Workload(ctx)
+	b.clientsChan[client] = reqChan
+}
+
+// Start dispatching requests to the server in a balanced way.
+func (b *Balancer) start(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Balancer shutting down")
+			return
+		default:
+			if b.weightedSlice.Len() > 0 {
+				client := b.weightedSlice.GetRandomItem()
+				log.Printf("Client %+v \n", client)
+				ch, ok := b.clientsChan[client]
+				if ok {
+					select {
+					case req, more := <-ch:
+						if more {
+							b.workQueue <- req
+						} else {
+							// Client channel closed
+							b.cleanupClient(client)
+						}
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		}
+	}
+}
+
+// Worker processes tasks from the work queue.
+func (b *Balancer) worker(i int, ctx context.Context) {
+	defer b.wg.Done()
+
+	for {
+		select {
+		case task := <-b.workQueue:
+			log.Printf("Worker %d processing task: %+v \n", i, task)
+			err := b.server.Process(ctx, task)
+			if err != nil {
+				log.Printf("Worker %d encountered error processing task: %v\n", i, err)
+			}
+		case <-ctx.Done():
+			log.Printf("Worker %d shutting down", i)
+			return
+		}
+	}
+}
+
+// WorkerPool creates a fixed number of workers.
+func (b *Balancer) workerPool(numWorkers int, ctx context.Context) {
+	b.wg.Add(numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		go b.worker(i, ctx)
+	}
+}
+
+// CleanupClient removes a client from the weighted slice and channel map.
+func (b *Balancer) cleanupClient(client Client) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	log.Printf("Cleaning up client %+v\n", client)
+	delete(b.clientsChan, client)
+	b.weightedSlice.RemoveItemByValue(client)
+}
+
+// Graceful shutdown of the balancer.
+func (b *Balancer) Shutdown() {
+	log.Println("Initiating shutdown...")
+	b.cancel()
+	b.wg.Wait()
+	log.Println("Shutdown complete")
 }
